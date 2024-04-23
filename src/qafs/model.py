@@ -87,7 +87,8 @@ class FeatureStoreVersion(Base):
 class Namespace(Base, FeatureStoreMixin):
     __tablename__ = "namespace"
 
-    backend = Column(String, nullable=True, default="pandas")
+    storage = Column(String, nullable=False)
+    partition = Column(partitions, default="date", nullable=False)
 
     @hybrid_property
     def namespace(self):
@@ -101,19 +102,10 @@ class Namespace(Base, FeatureStoreMixin):
     def namespace(cls):
         return cls.name
 
-    def _backend(self, storage):
-        # Check backend is available and get it
-        backend = "pandas" if not self.backend else self.backend.lower()
-        if self.backend in processor.available_backends:
-            return processor.available_backends[backend](storage=storage)
-        else:
-            raise RuntimeError(f"{backend} backend is not available: make sure and dependencies are installed")
-
-    def clean(self, storage):
+    def clean(self):
         # Check for unused data and remove it
-        store = self._backend(storage)
         active_feature_names = [f.name for f in self.features]
-        feature_data = store.ls()
+        feature_data = Storage(self.storage).ls()
         for feature in feature_data:
             if feature not in active_feature_names:
                 # Redundant data... delete it
@@ -126,7 +118,6 @@ class Feature(Base, FeatureStoreMixin):
     namespace = Column(String(128), ForeignKey("namespace.name"), primary_key=True)
     namespace_object = relationship("Namespace", backref="features")
 
-    partition = Column(partitions, default="date", nullable=False)
     serialized = Column(Boolean, default=False, nullable=False)
     transform = Column(JSON, nullable=True)
     check = Column(String(), nullable=False)
@@ -176,9 +167,8 @@ class Feature(Base, FeatureStoreMixin):
         clone.update_from_dict(payload)
         return clone
 
-    def save(self, df, storage):
-        store = self.namespace_object._backend(storage)
-        store.save(self.name, df, partition=self.partition, serialized=self.serialized)
+    def save(self, df, store):
+        store.save(self.namespace, df, partition=self.namespace_object.partition, serialized=self.serialized)
 
     def load_transform(self, storage, from_date, to_date, freq, time_travel, last=False, callers=[]):
         # Get the SQLAlchemy session for this feature
@@ -208,7 +198,7 @@ class Feature(Base, FeatureStoreMixin):
                 last=last,
                 callers=[*callers, self.full_name],
             )
-            dfs.append(df.rename(columns={"value": f"{namespace}/{name}"}))
+            dfs.append(df.rename(columns={name: f"{namespace}/{name}"}))
         # Merge features into a single dataframe
         dfs = ts.concat(dfs)
         # Make sure columns are in the same order as args
@@ -219,7 +209,7 @@ class Feature(Base, FeatureStoreMixin):
 
     def load(
         self,
-        storage,
+        store,
         from_date=None,
         to_date=None,
         freq=None,
@@ -230,7 +220,7 @@ class Feature(Base, FeatureStoreMixin):
         # Does this feature need to be transformed?
         if self.transform:
             return self.load_transform(
-                storage,
+                store,
                 from_date=from_date,
                 to_date=to_date,
                 freq=freq,
@@ -239,10 +229,6 @@ class Feature(Base, FeatureStoreMixin):
                 callers=callers,
             )
         
-
-        # Get backend
-        store = self.namespace_object._backend(storage)
-        
         # Restrict which partitions are loaded when getting last value
         if last:
             from_date = store.last(self.name)
@@ -250,7 +236,7 @@ class Feature(Base, FeatureStoreMixin):
         
         # Load dataframe
         return store.load(
-            self.name,
+            self.namespace,
             from_date=from_date,
             to_date=to_date,
             freq=freq,

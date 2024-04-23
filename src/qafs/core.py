@@ -3,23 +3,27 @@ import os
 from typing import Dict, List, Optional, Union
 
 import pandas as pd
+import pyspark
+from pyspark.sql import SparkSession
+
 import pandera
 from pandera import Column, DataFrameSchema, io
 
 from . import connection as conn
+from .storage import LocalStorage
 from . import model
 from . import timeseries as ts
 from . import upgrade as upgrade
 from . import utils
 from .exceptions import FeatureStoreException, MissingFeatureException
+from .backend import SparkBackend
 
+DEFAULT_NAMESPACE = 'base'
 
 class FeatureStore(object):
     """**QAFS Feature Store**"""
 
-    def __init__(self, storage, db_connection=None, 
-        backend="pandas", verbose=False
-    ):
+    def __init__(self, project, spark_session=None, verbose=False):
         """
         Args:
             storage (QAFSStorage): Storage manager.
@@ -27,11 +31,13 @@ class FeatureStore(object):
             backend (str): DataFrame backend.
             verbose (bool): Logging level. 
         """
-        db_connection = "/".join(["sqlite://", storage, 'fs.db']) if db_connection is None else db_connection
-        self.storage = storage
-        self.backend = backend
+        project_path = f'./.qafs/{project}'
+        db_connection = "/".join(["sqlite://", project_path, 'fs.db'])
+        self.storage = LocalStorage(path=f'{project_path}/storage')
+        os.makedirs(project_path, exist_ok=True)
+        self.spark_session = spark_session or SparkSession.builder.getOrCreate()
+        self.backend = SparkBackend(self.storage, self.spark_session)
         self.engine, self.session_maker = conn.connect(db_connection)
-        # self.check_raise_error = os.environ.get('QAFS_RAISE_ERROR', 'True').lower() in ('true', '1', 't')
         model.Base.metadata.create_all(self.engine)
         upgrade.upgrade(self.engine)
         utils.setup_logging(level=logging.INFO if verbose else logging.WARNING)
@@ -91,8 +97,9 @@ class FeatureStore(object):
         """
         return self._list(model.Namespace, name=name if name is not None else namespace, regex=regex)
 
+
     def create_namespace(
-        self, name: str, description: Optional[str] = None, meta: Optional[Dict] = {}
+        self, name: str, storage: Optional[LocalStorage] = None, partition: Optional[str] = None, description: Optional[str] = None, meta: Optional[Dict] = {}
     ):
         """Create a new namespace in the feature store.
 
@@ -102,15 +109,18 @@ class FeatureStore(object):
             name of the namespace.
         description: str, optional
             description for this namespace.
+        partition: str, optional
+            partitioning of stored timeseries (default: `"date"`).
         meta: dict, optional
             key/value pairs of metadata.
         """
         with conn.session_scope(self.session_maker) as session:
+            storage = storage or self.storage
             r = session.query(model.Namespace)
             r = r.filter_by(name=name)
             if not r.one_or_none():
                 obj = model.Namespace()
-                obj.update_from_dict({"name": name, "description": description, "meta": meta})
+                obj.update_from_dict({"name": name, "storage": storage.path, "partition": partition, "description": description, "meta": meta})
                 session.add(obj)
 
     def update_namespace(self, name: str, description: Optional[str] = None, meta: Optional[Dict] = {}):
@@ -244,7 +254,6 @@ class FeatureStore(object):
         check: Column,
         namespace: Optional[str] = None,
         description: Optional[str] = None,
-        partition: Optional[str] = None,
         serialized: Optional[bool] = None,
         transform: Optional[str] = None,
         meta: Optional[Dict] = None,
@@ -261,8 +270,6 @@ class FeatureStore(object):
             namespace which should hold this feature.
         description: str, optional
             description for this namespace.
-        partition: str, optional
-            partitioning of stored timeseries (default: `"date"`).
         serialized: bool, optional
             if `True`, converts values to JSON strings before saving,
             which can help in situations where the format/schema of the data changes
@@ -273,6 +280,8 @@ class FeatureStore(object):
             key/value pairs of metadata.
         """
         meta = meta if meta is not None else {}
+        namespace = namespace or DEFAULT_NAMESPACE
+
         ls = self._list(model.Namespace, namespace=namespace)
         if ls.empty:
             raise MissingFeatureException(f"{namespace} namespace does not exist")
@@ -303,7 +312,6 @@ class FeatureStore(object):
                     "name": name,
                     "namespace": namespace,
                     "description": description,
-                    "partition": partition,
                     "serialized": serialized,
                     "transform": transform,
                     "check": check_yaml,
@@ -382,7 +390,7 @@ class FeatureStore(object):
                 obj.delete_data(self.storage)
             session.delete(obj)
 
-    def save_df(self, df: pd.DataFrame, name: Optional[str] = None, namespace: Optional[str] = None):
+    def save(self, df: Union[pd.DataFrame, pyspark.sql.DataFrame], features: Optional[List[str]] = None, namespace: Optional[str] = None, index: Optional[str] = None):
         """Save a DataFrame of feature values to the feature store.
 
         Parameters
@@ -401,9 +409,13 @@ class FeatureStore(object):
         feature_columns = df.columns.difference(["time", "created_time"])
 
         if len(feature_columns) == 1:
-            if name is None:
-                name = feature_columns[0]
-            if self.list_features(name=name, namespace=namespace).empty:
+            if features is None:
+                feature = feature_columns[0]
+            
+            namespace = namespace or DEFAULT_NAMESPACE
+            name = features[0]
+
+            if self.list_features(name=name).empty:
                 raise MissingFeatureException(f"Feature named {name} does not exist in {namespace}")
 
             # Save data for this feature
@@ -426,17 +438,17 @@ class FeatureStore(object):
                     else:
                         logging.error(str(pse))
 
-                df = df.rename(columns={name: "value"})
-                feature.save(df, self.storage)
+                # df = df.rename(columns={name: f"{namespace}/{name}"})
+                feature.save(df, self.backend)
         else:
-            if name is not None:
-                feature_df = df[[*df.columns.difference(feature_columns), name]]
-                self.save_df(feature_df, name=name, namespace=namespace)
+            if feature is not None:
+                feature_df = df[[*df.columns.difference(feature_columns), feature]]
+                self.save(feature_df, feature=feature)
             else:
                 for feature_name in feature_columns:
                     # Save individual features
                     feature_df = df[[*df.columns.difference(feature_columns), feature_name]]
-                    self.save_df(feature_df, name=feature_name, namespace=namespace)
+                    self.save(feature_df, name=feature_name)
 
     def load_features(
         self,
@@ -470,7 +482,9 @@ class FeatureStore(object):
         dfs = []
         # Load each requested feature
         for f in features:
-            namespace, name = f.namespace, f.name
+            name_splited = f.split('/')
+            namespace = name_splited[0] if len(name_splited) > 1 else DEFAULT_NAMESPACE
+            name = name_splited[-1]
             with conn.session_scope(self.session_maker) as session:
                 feature = session.query(model.Feature).filter_by(name=name, namespace=namespace).one_or_none()
                 if not feature:
@@ -478,13 +492,13 @@ class FeatureStore(object):
 
                 # Load individual feature
                 df = feature.load(
-                    str(self.storage),
+                    self.backend,
                     from_date=from_date,
                     to_date=to_date,
                     freq=freq,
                     time_travel=time_travel,
                 )
-                dfs.append(df.rename(columns={"value": f"{namespace}/{name}"}))
+                dfs.append(df.rename(columns={name: f"{namespace}/{name}"}))
         return ts.concat(dfs)
 
     def update_feature(
@@ -538,7 +552,7 @@ class FeatureStore(object):
 
             obj.update_from_dict(to_update)
 
-    def transform(self, name: str, check: Column, namespace: Optional[str] = None, from_features: List = []):
+    def transform(self, name: str, check: Column, t_namespace: Optional[str] = None, from_features: List = []):
         """Decorator for creating/updating virtual (transformed) features.
 
         Use this on a function that accepts a dataframe input and returns an output dataframe
@@ -550,7 +564,7 @@ class FeatureStore(object):
             feature to update.
         check: Column
             data validation check.
-        namespace: str, optional
+        t_namespace: str, optional
             namespace, if not included in feature name.
         from_features: list
             list of features which should be transformed by this one
@@ -560,10 +574,16 @@ class FeatureStore(object):
             # Create or update feature with transform
             computed_from = [str(f) for f in from_features]
             for feature in from_features:
+                feature_split = feature.split('/')
+                feature_namespace = feature_split[0] if len(feature_split) > 1 else DEFAULT_NAMESPACE
+                feature_name = feature_split[-1]
+
                 # assert self._exists(
                 #     model.Feature, name=feature
                 # ), f"{feature} does not exist in the feature store"
-                assert not self.list_features(name=feature.name, namespace=feature.namespace).empty, f"'{feature.namespace}/{feature.name}' does not exist in the feature store"
+                assert not self.list_features(name=feature_name, namespace=feature_namespace).empty, f"'{feature}' does not exist in the feature store"
+            
+            namespace = t_namespace or DEFAULT_NAMESPACE
             transform = {"function": func, "args": computed_from}
             payload = {"transform": transform, "description": func.__doc__}
             if not self.list_features(namespace=namespace, name=name).empty:

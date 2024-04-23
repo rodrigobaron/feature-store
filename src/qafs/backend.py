@@ -1,22 +1,85 @@
+import types
+from abc import ABC, abstractmethod
 import posixpath
 import warnings
 import os
 
-import dask
-import dask.dataframe as dd
 import fsspec
 import numpy as np
 import pandas as pd
-import pyarrow as pa
+import pyspark
+import pyspark.sql.functions as F
+from pyspark.sql.functions import current_timestamp
 
-from ._base import BaseBackend
+
+class BaseBackend(ABC):
+    """Base storage class for timeseries data.
+    Sub-class this to add additional storage backends.
+    """
+
+    def __init__(self, storage, options={}):
+        self.storage = storage
+        self.options = options
+
+    @abstractmethod
+    def ls(self):
+        """List features contained in storage."""
+        raise NotADirectoryError()
+
+    @abstractmethod
+    def load(self, name, from_date=None, to_date=None, freq=None, time_travel=None, **kwargs):
+        """Load a single timeseries dataframe from storage."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def save(self, name, df, **kwargs):
+        """Save a timeseries dataframe."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def first(self, name, **kwargs):
+        """Retrieves first index from the timeseries."""
+        raise NotImplementedError()
+
+    def last(self, name, **kwargs):
+        """Retrieves last index from the timeseries."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def delete(self, name):
+        """Delete the data for a feature."""
+        raise NotImplementedError()
+
+    def copy(self, from_name, to_name, destination_store):
+        """Used during clone operations to copy timeseries data between locations.
+        Override this to implement more efficient copying between specific storage backends.
+        """
+        # Export existing data
+        ddf = self._export(from_name)
+        # Import to destination
+        if isinstance(ddf, types.GeneratorType):
+            for ddf_ in ddf:
+                destination_store._import(to_name, ddf_)
+        else:
+            destination_store._import(to_name, ddf)
+
+    @abstractmethod
+    def _export(self, name):
+        """Export a timeseries as standardised dataframe."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def _import(self, name, ddf):
+        """Import a timeseries from standardised dataframe."""
+        raise NotImplementedError()
 
 
-class Backend(BaseBackend):
-    """Pandas-backed timeseries data storage."""
+class SparkBackend(BaseBackend):
+    """Spark-backed timeseries data storage."""
 
-    def __init__(self, storage, options=None):
+    def __init__(self, storage, spark_session, options=None):
         super().__init__(storage, options=options if options is not None else {})
+        self.spark_session = spark_session
 
     @staticmethod
     def _clean_dict(d):
@@ -36,7 +99,7 @@ class Backend(BaseBackend):
         return fs, feature_path
 
     def _full_feature_path(self, name):
-        return posixpath.join(str(self.storage), "feature", name)
+        return posixpath.join(str(self.storage), "features", name)
 
     def _list_partitions(self, name, n=None, reverse=False):
         """List the available partitions for a feature."""
@@ -49,11 +112,9 @@ class Backend(BaseBackend):
         partitions = []
         for _obj in objects:
             obj = _obj.replace(feature_path + os.path.sep, '')
-            if obj.startswith("partition="):
-                partitions.append(obj.split("=")[1])
+            if len(obj.split("="))>1:
+                partitions.append(obj.split("=")[0])
 
-        # partitions = [obj for obj in objects if obj.startswith("partition=")]
-        # partitions = [p.split("=")[1] for p in partitions]
         partitions = sorted(partitions, reverse=reverse)
         if n:
             partitions = partitions[:n]
@@ -61,34 +122,39 @@ class Backend(BaseBackend):
 
     @staticmethod
     def _apply_partition(partition, dt, offset=0):
-        if isinstance(dt, dd.core.Series):
+        if isinstance(dt, pd.Series):
             if partition == "year":
                 return dt.dt.year + offset
             elif partition == "date":
                 return (dt + pd.Timedelta(days=offset)).dt.strftime("%Y-%m-%d")
             else:
                 raise NotImplementedError(f"{partition} has not been implemented")
+        elif isinstance(dt, pyspark.sql.Column):
+            if partition == "year":
+                return dt.dt.year + offset
+            elif partition == "date":
+                return F.date_add(dt, offset)
+            else:
+                raise NotImplementedError(f"{partition} has not been implemented")
+
 
     def _write(self, name, ddf, **kwargs):
         # Write to output location
         feature_path = self._full_feature_path(name)
-        # Build schema
-        schema = {"time": pa.timestamp("ns"), "created_time": pa.timestamp("ns")}
-        for field in pa.Table.from_pandas(ddf.head()).schema:
-            if field.name in ["value", "partition"]:
-                schema[field.name] = field.type
-        try:
-            ddf.to_parquet(
-                feature_path,
-                engine="pyarrow",
-                compression="snappy",
-                write_index=True,
-                append=kwargs.get("append", False),
-                partition_on="partition",
-                ignore_divisions=True,
-                schema=schema,
-                storage_options=self._clean_dict(self.options),
+        if not isinstance(ddf, pyspark.sql.DataFrame):
+            df = (
+                self.spark_session
+                .createDataFrame(ddf)
+                .withColumn("created_time", current_timestamp())
             )
+        else:
+            df = ddf
+        try:
+            mode = "append" if kwargs.get("append") else "overwrite"
+            df.write.option("header", True) \
+            .partitionBy("partition") \
+            .mode(mode) \
+            .parquet(feature_path)
         except Exception as e:
             raise RuntimeError(f"Unable to save data to {feature_path}: {str(e)}")
 
@@ -99,29 +165,24 @@ class Backend(BaseBackend):
             filters.append(("time", "==", pd.Timestamp(exactly_date)))
         else:
             if from_date:
-                filters.append(("time", ">=", pd.Timestamp(from_date)))
+                filters.append(("time", ">=", f"'{str(pd.Timestamp(from_date))}'"))
             if to_date:
-                filters.append(("time", "<=", pd.Timestamp(to_date)))
+                filters.append(("time", "<=", f"'{str(pd.Timestamp(to_date))}'"))
         if kwargs.get("partitions"):
             for p in kwargs.get("partitions"):
                 filters.append(("partition", "==", p))
-        filters = filters if filters else None
         # Read the data
         feature_path = self._full_feature_path(name)
-        try:
-            ddf = dd.read_parquet(
-                feature_path,
-                engine="pyarrow",
-                filters=filters,
-                storage_options=self._clean_dict(self.options),
-            )
-            ddf = ddf.repartition(partition_size="25MB")
-        except PermissionError as e:
-            raise e
-        # except Exception:
-        #     # No data available
-        #     empty_df = pd.DataFrame(columns=["time", "created_time", "value", "partition"]).set_index("time")
-        #     ddf = dd.from_pandas(empty_df, chunksize=1)
+        ddf = self.spark_session.read.option("header",True) \
+        .parquet(feature_path)
+
+        if len(filters) > 0:
+            condition_query = " and ".join([" ".join(f) for f in filters])
+            ddf.createOrReplaceTempView("TEMP")
+            ddf = self.spark_session.sql(f"select * from TEMP where 1=1 and {condition_query}")
+
+        ddf = ddf.toPandas()
+
         if "partition" in ddf.columns:
             ddf = ddf.drop(columns="partition")
         # Apply time-travel
@@ -147,18 +208,15 @@ class Backend(BaseBackend):
 
     def load(self, name, from_date=None, to_date=None, freq=None, time_travel=None, **kwargs):
         ddf = self._read(name, from_date, to_date, freq, time_travel, **kwargs)
-        
-        if not from_date:
-            from_date = ddf.index.min().compute()  # First value in data
-        if not to_date:
-            to_date = ddf.index.max().compute()  # Last value in data
+        from_date = ddf.time.min()  # First value in data
+        to_date = ddf.time.max()  # Last value in data
         if pd.Timestamp(to_date) < pd.Timestamp(from_date):
             to_date = from_date
 
-        pdf = ddf.compute()
+        pdf = ddf
         
         # Keep only last created_time for each index timestamp
-        pdf = pdf.reset_index().set_index("created_time").sort_index().groupby("time").last()
+        pdf = pdf.set_index("created_time").sort_index().groupby("time").last()
 
         # Apply resampling/date filtering
         if freq:
@@ -222,42 +280,35 @@ class Backend(BaseBackend):
         return ddf["value"]
 
     def save(self, name, df, **kwargs):
-        if df.empty:
+        if isinstance(df, pd.DataFrame):
+            df = self.spark_session.createDataFrame(df) 
+
+        if df.isEmpty():
             # Nothing to do
             return
-        # Convert Pandas -> Dask
-        if isinstance(df, pd.DataFrame):
-            ddf = dd.from_pandas(df, chunksize=100000)
-        elif isinstance(df, dd.DataFrame):
-            ddf = df
-        else:
-            raise ValueError("Data must be supplied as a Pandas or Dask DataFrame")
-        # Check value columm
-        if "value" not in ddf.columns:
-            raise ValueError("DataFrame must contain a value column")
+
+        ddf = df
         # Check we have a timestamp index column
-        if np.issubdtype(ddf.index.dtype, np.datetime64):
-            ddf = ddf.reset_index()
-            if "time" in df.columns:
+        def get_dtype(df,colname):
+            return [dtype for name, dtype in df.dtypes if name == colname][0]
+        
+        if get_dtype(ddf, 'time') != 'timestamp':
                 raise ValueError("Not sure whether to use timestamp index or time column")
         # Check time column
         partition = kwargs.get("partition", "date")
-        if "time" in ddf.columns:
-            ddf = ddf.assign(time=ddf.time.astype("datetime64[ns]"))
-            # Add partition column
-            ddf = ddf.assign(partition=self._apply_partition(partition, ddf.time))
-            ddf = ddf.set_index("time")
-        else:
-            raise ValueError(f"DataFrame must be supplied with timestamps, not {ddf.index.dtype}")
+        # if "time" in ddf.columns:
+        #     ddf = ddf.assign(time=ddf.time.astype("datetime64[ns]"))
+        #     # Add partition column
+        #     ddf = ddf.assign(partition=self._apply_partition(partition, ddf.time))
+        #     ddf = ddf.set_index("time")
+        # else:
+        #     raise ValueError(f"DataFrame must be supplied with timestamps, not {ddf.index.dtype}")
+        ddf = ddf.withColumn("partition", self._apply_partition(partition, ddf.time))
         # Check for created_time column
         if "created_time" not in ddf.columns:
-            ddf = ddf.assign(created_time=pd.Timestamp.now())
-        else:
-            ddf = ddf.assign(created_time=ddf.created_time.astype("datetime64[ns]"))
-        # Check for extraneous columns
-        extraneous = set(ddf.columns) - set(["created_time", "value", "partition"])
-        if len(extraneous) > 0:
-            raise ValueError(f"DataFrame contains extraneous columns: {extraneous}")
+            ddf = ddf.withColumn("created_time", current_timestamp())
+        # else:
+        #     ddf = ddf.assign(created_time=ddf.created_time.astype("datetime64[ns]"))
         # Serialize to JSON if required
         if kwargs.get("serialized"):
             ddf = ddf.map_partitions(lambda df: df.assign(value=df.value.apply(pd.io.json.dumps)))
@@ -291,6 +342,6 @@ class Backend(BaseBackend):
         if ddf is None or len(ddf.columns) == 0:
             return
         if "partition" not in ddf.columns:
-            raise RuntimeError("Dask storage requires partitioning")
+            raise RuntimeError("Spark storage requires partitioning")
         # Copy data to new location
         self._write(name, ddf, append=False)
